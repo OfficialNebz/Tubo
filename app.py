@@ -4,6 +4,8 @@ import json
 import time
 from bs4 import BeautifulSoup
 import google.generativeai as genai
+from PIL import Image
+from io import BytesIO
 
 # --- 1. CONFIGURATION ---
 st.set_page_config(
@@ -92,8 +94,9 @@ NOTION_API_URL = "https://api.notion.com/v1/pages"
 # --- 4. SIDEBAR ---
 with st.sidebar:
     st.markdown("### COMMAND CENTER")
-    st.caption("Tubo Intelligence v1.0")
+    st.caption("Tubo Intelligence v2.0 (Vision Enabled)")
     if st.button("🔄 RESET SYSTEM"):
+        st.cache_data.clear()
         st.session_state.clear()
         st.rerun()
     st.markdown(
@@ -125,23 +128,25 @@ if not st.session_state.authenticated:
     st.stop()
 
 
-# --- 6. INTELLIGENCE ENGINE ---
+# --- 6. INTELLIGENCE ENGINE (VISION + CACHE) ---
 
+@st.cache_data(show_spinner=False)
 def scrape_website(target_url):
-    # Standard Scraper Logic (Optimized)
+    # Standard Scraper Logic (Optimized for JSON)
     headers = {'User-Agent': 'Mozilla/5.0'}
     clean_url = target_url.split('?')[0]
     json_url = f"{clean_url}.json"
     title = "Tubo Piece"
     desc_text = ""
+    raw_json = None
 
-    # Strategy 1: JSON
+    # Strategy 1: JSON (The Vision Source)
     try:
         r = requests.get(json_url, headers=headers, timeout=5)
         if r.status_code == 200:
-            data = r.json().get('product', {})
-            title = data.get('title', title)
-            raw_html = data.get('body_html', "")
+            raw_json = r.json().get('product', {})
+            title = raw_json.get('title', title)
+            raw_html = raw_json.get('body_html', "")
             soup = BeautifulSoup(raw_html, 'html.parser')
             desc_text = soup.get_text(separator="\n", strip=True)
     except:
@@ -153,15 +158,14 @@ def scrape_website(target_url):
             r = requests.get(target_url, headers=headers, timeout=5)
             soup = BeautifulSoup(r.content, 'html.parser')
             if soup.find('h1'): title = soup.find('h1').text.strip()
-            # Generic Selectors usually work for Shopify sites like Tubo
             main_block = soup.find('div', class_='product-description') or \
                          soup.find('div', class_='rte') or \
                          soup.find('div', class_='product__description')
             if main_block: desc_text = main_block.get_text(separator="\n", strip=True)
         except Exception as e:
-            return None, f"Scrape Error: {str(e)}"
+            return None, f"Scrape Error: {str(e)}", None
 
-    if not desc_text: return title, "[NO TEXT FOUND]"
+    if not desc_text: return title, "[NO TEXT FOUND]", None
 
     # Clean Text
     clean_lines = []
@@ -169,14 +173,49 @@ def scrape_website(target_url):
         upper = line.upper()
         if any(x in upper for x in ["SHIPPING", "RETURNS", "SIZE", "WHATSAPP", "ADD TO CART"]): continue
         if len(line) > 5: clean_lines.append(line)
-    return title, "\n".join(clean_lines[:25])
+
+    return title, "\n".join(clean_lines[:25]), raw_json
 
 
-def generate_campaign(product_name, description, key):
+@st.cache_data(show_spinner=False)
+def get_optimized_images(product_json):
+    """
+    Downloads up to 3 images, resized to 800px width for speed.
+    """
+    if not product_json: return []
+
+    images = []
+    raw_images = product_json.get('images', [])[:3]
+
+    for img in raw_images:
+        src = img.get('src', '')
+        if src:
+            # OPTIMIZATION: Request the 800px wide version from Shopify
+            if ".jpg" in src:
+                optimized_src = src.replace(".jpg", "_800x.jpg")
+            elif ".png" in src:
+                optimized_src = src.replace(".png", "_800x.png")
+            else:
+                optimized_src = src
+
+            try:
+                response = requests.get(optimized_src, timeout=3)
+                if response.status_code == 200:
+                    img_bytes = BytesIO(response.content)
+                    images.append(Image.open(img_bytes))
+            except:
+                continue
+
+    return images
+
+
+@st.cache_data(show_spinner=False)
+def generate_campaign(product_name, description, _images, key):
     genai.configure(api_key=key)
-    model = genai.GenerativeModel('gemini-flash-latest')
+    # VERIFIED STABLE MODEL
+    model = genai.GenerativeModel('models/gemini-flash-latest')
 
-    # --- THE TUBO PROMPT ---
+    # --- THE TUBO PROMPT (UNCHANGED SOUL) ---
     prompt = f"""
     Role: Brand Voice Director for 'TUBO'.
     Brand Voice: "The Snatched Waist." Unapologetic, High-Voltage, Sculptural, Celebratory.
@@ -184,9 +223,10 @@ def generate_campaign(product_name, description, key):
     Specs: {description}
 
     TASK:
-    1. Select TOP 3 Personas.
-    2. Write 3 Captions.
-    3. Write 1 "Tubo Woman Signature".
+    1. VISUAL AUDIT: Look at the images. Analyze the corsetry, the silhouette, and the 'snatch'.
+    2. Select TOP 3 Personas.
+    3. Write 3 Captions.
+    4. Write 1 "Tubo Woman Signature".
 
     PERSONAS:
     1. The Headline Bride (Tone: All eyes on me. The main character energy.)
@@ -205,8 +245,13 @@ def generate_campaign(product_name, description, key):
         {{"persona": "Tubo Woman Signature", "post": "The unified caption text..."}}
     ]
     """
+
+    content_payload = [prompt]
+    if _images:
+        content_payload.extend(_images)
+
     try:
-        response = model.generate_content(prompt)
+        response = model.generate_content(content_payload)
         txt = response.text
         if "```json" in txt: txt = txt.split("```json")[1].split("```")[0]
         return json.loads(txt.strip())
@@ -217,7 +262,6 @@ def generate_campaign(product_name, description, key):
 def save_to_notion(p_name, post, persona, token, db_id):
     if not token or not db_id: return False, "Notion Secrets Missing"
 
-    # AUTO-FIX FOR ID
     clean_db_id = str(db_id).strip().replace("/", "")
 
     headers = {
@@ -251,7 +295,7 @@ st.markdown("<br>", unsafe_allow_html=True)
 st.title("TUBO / INTELLIGENCE")
 st.markdown("---")
 
-# --- MANUAL ADDED HERE ---
+# --- MANUAL WITH SCREENSHOTS ---
 with st.expander("📖 SYSTEM MANUAL (CLICK TO OPEN)"):
     st.markdown("### OPERATIONAL GUIDE")
     st.markdown("---")
@@ -299,14 +343,25 @@ if st.button("GENERATE ASSETS", type="primary"):
     elif not url_input:
         st.error("Paste a URL first.")
     else:
-        with st.spinner("Analyzing Silhouette & Structure..."):
-            st.session_state.gen_id += 1
-            p_name, p_desc = scrape_website(url_input)
-            if p_name is None:
-                st.error(p_desc)
-            else:
+        with st.spinner("ANALYZING SILHOUETTE & SCULPTURE..."):
+            # 1. Scrape
+            p_name, desc, raw_json = scrape_website(url_input)
+
+            if p_name:
                 st.session_state.p_name = p_name
-                st.session_state.results = generate_campaign(p_name, p_desc, api_key)
+
+                # 2. Get Images
+                images_list = []
+                if raw_json:
+                    st.toast("📸 scanning structure...")
+                    images_list = get_optimized_images(raw_json)
+
+                # 3. Generate
+                st.session_state.results = generate_campaign(p_name, desc, images_list, api_key)
+                st.session_state.gen_id += 1
+                st.rerun()
+            else:
+                st.error(f"❌ CONNECTION FAILED: {desc}")
 
 # --- 8. RESULTS DASHBOARD ---
 if st.session_state.results:
